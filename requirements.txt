@@ -1,0 +1,8 @@
+streamlit>=1.30
+altair>=5.0
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+sentence-transformers>=2.2
+# Optional: tighter topical clustering in the 2D map (app falls back to PCA if absent)
+umap-learn>=0.5
