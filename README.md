@@ -29,6 +29,21 @@ pip install -r requirements.txt
 
 First run downloads the embedding model (~90 MB) once.
 
+## Pre-calculate artifacts (fast startup)
+
+Run once so the app loads instantly — this precomputes and caches to disk the
+embeddings, **both the PCA and UMAP co-fit projections** (the UMAP fit is the
+slow step, ~11 s), and the default-manuscript embedding:
+
+```bash
+python precompute.py
+```
+
+After this the app starts in ~1 s with no model load and no projection fitting;
+it just reads the cached artifacts from `data/.cache/`. Re-run `precompute.py`
+whenever you change `members_enriched.csv` or add abstract batches (the caches
+are keyed by data size/content and rebuild automatically otherwise).
+
 ## Run
 
 ```bash

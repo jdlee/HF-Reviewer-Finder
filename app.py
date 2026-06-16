@@ -75,6 +75,9 @@ def corpus_embeddings(texts: tuple[str, ...]):
 
 @st.cache_data(show_spinner=False)
 def query_vec(text: str):
+    # The default manuscript's embedding is precomputed on disk → no model load.
+    if text == engine.DEFAULT_QUERY:
+        return engine.default_query_embedding()
     return engine.embed_query(text)
 
 
@@ -88,42 +91,23 @@ def abstract_embeddings(texts: tuple[str, ...]):
     return engine.embed_corpus(list(texts))
 
 
+@st.cache_resource(show_spinner="Building 2D projection (co-fitting reviewers + papers)…")
+def fit_projection(method: str, sig: tuple, _corpus, _extra):
+    """Co-fit reviewers + papers once per method; cached across reruns.
+    `sig` (hashed) invalidates the cache if the data changes; `_corpus`/`_extra`
+    are large arrays passed unhashed. Reducer + coords are also persisted to disk
+    so the slow UMAP co-fit survives app restarts."""
+    return engine.load_or_build_projection(_corpus, _extra, method=method)
+
+
 df = load_data()
 abstracts = load_abstracts()
 abs_emb = abstract_embeddings(tuple(abstracts["abstract_text"].tolist()))
 
-# Default manuscript shown (and ranked) on first load.
-DEFAULT_QUERY = (
-    "Research on trust in generative and agentic AI has focused on system "
-    "trustworthiness and user adoption, neglecting the cognitive mechanisms that "
-    "govern how people calibrate trust in systems that are probabilistic, opaque, "
-    "and socially legible. The central question is not whether AI is trusted or "
-    "trustworthy, but whether it is trustable: designed so people can form, "
-    "maintain, and revise warranted trust. Calibration matches trust to capability; "
-    "warrant grounds it in the actual causes of capability. A computational review "
-    "of 2,342 papers and a narrative synthesis identify characteristics "
-    "distinguishing generative and agentic AI from traditional automation. We "
-    "identify 14 trust-relevant characteristics and organize them by three "
-    "challenges: calibration (how much to trust), comprehension (what is being "
-    "trusted), and boundary (where AI’s contribution ends and the person’s begins). "
-    "These characteristics disrupt trust calibration through four cognitive "
-    "mechanisms: attribution, by impoverishing covariation information; construal "
-    "level, by widening psychological distance; sensemaking, by stabilizing initial "
-    "frames against revision; and anthropomorphism, by activating human-oriented "
-    "social cognition. Together, these mechanisms drive the person’s attributional "
-    "hierarchy out of alignment with the AI's functional abstraction hierarchy; "
-    "misalignment produces miscalibration. We propose cross-hierarchy alignment as "
-    "the central design construct for trustable AI, which defines strategies for "
-    "functional anthropomorphism in interface design, and for role and relationship "
-    "engineering—operationalized through 11 design principles. Panarchy theory "
-    "extends the analysis to sociotechnical systems, showing how attributional bleed "
-    "may propagate miscalibration to institutional and societal scales. Trustable AI "
-    "requires designing the human-AI ecology that shapes trust, not only the model, "
-    "interface, or dyadic interaction."
-)
+# Seed the default manuscript (defined in engine, shared with precompute.py).
 for _k in ("query", "query_input"):
     if _k not in st.session_state:
-        st.session_state[_k] = DEFAULT_QUERY
+        st.session_state[_k] = engine.DEFAULT_QUERY
 
 # ---- Sidebar: manuscript description (the query input) ------------------- #
 with st.sidebar:
@@ -166,13 +150,15 @@ st.caption(
 
 # ---- Compute (map always; ranking only when a query is present) ---------- #
 corpus = corpus_embeddings(tuple(df["profile_text"].tolist()))
+# Reviewers + papers are co-fit on one shared manifold (cached per method);
+# the manuscript is transformed into that same space per query.
+reducer, coords, abs_coords = fit_projection(method, (len(df), len(abstracts)), corpus, abs_emb)
 if has_query:
-    _model()  # warm the model cache (shows spinner once)
-    q = query_vec(query)
+    q = query_vec(query)  # default query is precomputed; others load the model lazily
     sims = engine.cosine_similarity(corpus, q)
-    coords, qcoord, abs_coords = engine.project_2d(corpus, q, extra_emb=abs_emb, method=method)
+    qcoord = engine.transform_query(reducer, q)
 else:
-    coords, qcoord, abs_coords = engine.project_2d(corpus, None, extra_emb=abs_emb, method=method)
+    qcoord = None
 
 abs_df = pd.DataFrame({
     "x": abs_coords[:, 0],
@@ -257,11 +243,24 @@ st.altair_chart(chart, use_container_width=True)
 if not has_query:
     st.stop()
 
-# ---- Ranked table (top 20, scrollable ~8 rows; select a row for details) - #
-TABLE_N = 20
+# ---- Ranked table (scrollable ~8 rows; filter + select a row for details) - #
+TABLE_N = 25
 st.subheader(f"Top {min(TABLE_N, len(view))} ranked reviewers")
-st.caption("Select a row to see that reviewer's details below.")
-table = view.head(TABLE_N)[
+name_filter = st.text_input(
+    "Filter by reviewer name",
+    placeholder="Filter by reviewer name…",
+    label_visibility="collapsed",
+)
+table_src = view
+if name_filter.strip():
+    table_src = view[view["name"].str.contains(
+        name_filter.strip(), case=False, na=False, regex=False)]
+table_src = table_src.head(TABLE_N)
+st.caption(
+    (f"{len(table_src)} match “{name_filter.strip()}” — " if name_filter.strip() else "")
+    + "select a row to see that reviewer's details below."
+)
+table = table_src[
     ["match_rank", "name", "rank", "similarity", "expertise_short", "top_recent"]
 ].rename(
     columns={
@@ -294,9 +293,12 @@ event = st.dataframe(
 
 # ---- Detailed reviewer information (driven by table selection) ---------- #
 sel = list(event.selection.rows) if getattr(event, "selection", None) else []
-idx = sel[0] if sel else 0
-row = view.iloc[idx]
 st.subheader("Reviewer details")
+if len(table_src) == 0:
+    st.info("No reviewers match that filter.")
+    st.stop()
+idx = sel[0] if (sel and sel[0] < len(table_src)) else 0
+row = table_src.iloc[idx]
 with st.container(border=True):
     st.markdown(f"**{row['name']}**  ·  _{row['rank']}_  ·  similarity **{row['similarity']:.2f}**")
     st.markdown(f"_{row['expertise_overview']}_")

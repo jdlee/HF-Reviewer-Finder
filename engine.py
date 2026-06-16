@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 from functools import lru_cache
 
 import numpy as np
@@ -124,6 +125,127 @@ def cosine_similarity(corpus_emb: np.ndarray, query_emb: np.ndarray) -> np.ndarr
     return corpus_emb @ query_emb
 
 
+def _make_reducer(method: str, seed: int):
+    """Construct a 2D reducer. Falls back to PCA if UMAP is unavailable."""
+    method = (method or "pca").lower()
+    if method == "umap":
+        try:
+            import umap  # type: ignore
+
+            return umap.UMAP(n_components=2, random_state=seed, n_neighbors=15)
+        except Exception:
+            pass
+    from sklearn.decomposition import PCA
+
+    return PCA(n_components=2, random_state=seed)
+
+
+def fit_project(
+    corpus_emb: np.ndarray,
+    extra_emb: np.ndarray | None = None,
+    method: str = "pca",
+    seed: int = 42,
+):
+    """Co-fit the 2D reducer on reviewers AND papers together so both groups
+    share one manifold, then read off each group's coordinates.
+
+    Returns (reducer, corpus_coords[N,2], extra_coords[M,2] or None). The fitted
+    reducer is returned so the (per-query) manuscript point can later be placed
+    in the *same* space via `transform_query` without re-fitting.
+    """
+    n = len(corpus_emb)
+    fit_data = corpus_emb if extra_emb is None else np.vstack([corpus_emb, extra_emb])
+    reducer = _make_reducer(method, seed)
+    try:
+        embedded = np.asarray(reducer.fit_transform(fit_data))
+    except Exception:
+        # UMAP can occasionally fail; fall back to PCA on the same data.
+        from sklearn.decomposition import PCA
+
+        reducer = PCA(n_components=2, random_state=seed)
+        embedded = np.asarray(reducer.fit_transform(fit_data))
+    corpus_coords = embedded[:n]
+    extra_coords = None if extra_emb is None else embedded[n:]
+    return reducer, corpus_coords, extra_coords
+
+
+def transform_query(reducer, query_emb: np.ndarray) -> np.ndarray:
+    """Place a single new point (the manuscript) into an already-fitted space."""
+    return np.asarray(reducer.transform(np.asarray(query_emb).reshape(1, -1))[0])
+
+
+def load_or_build_projection(corpus_emb, extra_emb=None, method="pca", seed=42):
+    """Like `fit_project`, but the fitted reducer and coordinates are persisted
+    to disk, so the (slow) UMAP co-fit runs only ONCE per dataset+method ever —
+    subsequent app starts load it instantly. Cache key includes the group sizes,
+    so it rebuilds automatically when the reviewer or paper set changes.
+
+    Returns (reducer, corpus_coords, extra_coords).
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    n_extra = 0 if extra_emb is None else len(extra_emb)
+    path = os.path.join(CACHE_DIR, f"proj_{method}_{len(corpus_emb)}_{n_extra}.pkl")
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                d = pickle.load(fh)
+            return d["reducer"], d["corpus_coords"], d["extra_coords"]
+        except Exception:
+            pass  # corrupt/incompatible cache → rebuild
+    reducer, c, e = fit_project(corpus_emb, extra_emb, method=method, seed=seed)
+    try:
+        with open(path, "wb") as fh:
+            pickle.dump({"reducer": reducer, "corpus_coords": c, "extra_coords": e}, fh)
+    except Exception:
+        pass  # non-fatal: just recompute next time
+    return reducer, c, e
+
+
+# Default manuscript shown (and ranked) on first load — kept here so both the
+# app and the precompute script reference the same text.
+DEFAULT_QUERY = (
+    "Research on trust in generative and agentic AI has focused on system "
+    "trustworthiness and user adoption, neglecting the cognitive mechanisms that "
+    "govern how people calibrate trust in systems that are probabilistic, opaque, "
+    "and socially legible. The central question is not whether AI is trusted or "
+    "trustworthy, but whether it is trustable: designed so people can form, "
+    "maintain, and revise warranted trust. Calibration matches trust to capability; "
+    "warrant grounds it in the actual causes of capability. A computational review "
+    "of 2,342 papers and a narrative synthesis identify characteristics "
+    "distinguishing generative and agentic AI from traditional automation. We "
+    "identify 14 trust-relevant characteristics and organize them by three "
+    "challenges: calibration (how much to trust), comprehension (what is being "
+    "trusted), and boundary (where AI’s contribution ends and the person’s begins). "
+    "These characteristics disrupt trust calibration through four cognitive "
+    "mechanisms: attribution, by impoverishing covariation information; construal "
+    "level, by widening psychological distance; sensemaking, by stabilizing initial "
+    "frames against revision; and anthropomorphism, by activating human-oriented "
+    "social cognition. Together, these mechanisms drive the person’s attributional "
+    "hierarchy out of alignment with the AI's functional abstraction hierarchy; "
+    "misalignment produces miscalibration. We propose cross-hierarchy alignment as "
+    "the central design construct for trustable AI, which defines strategies for "
+    "functional anthropomorphism in interface design, and for role and relationship "
+    "engineering—operationalized through 11 design principles. Panarchy theory "
+    "extends the analysis to sociotechnical systems, showing how attributional bleed "
+    "may propagate miscalibration to institutional and societal scales. Trustable AI "
+    "requires designing the human-AI ecology that shapes trust, not only the model, "
+    "interface, or dyadic interaction."
+)
+
+
+def default_query_embedding() -> np.ndarray:
+    """Embedding of DEFAULT_QUERY, persisted to disk so the initial ranked load
+    needs no model in memory. Computed once (loading the model) by precompute.py."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    key = hashlib.sha256(DEFAULT_QUERY.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(CACHE_DIR, f"default_query_{key}.npy")
+    if os.path.exists(path):
+        return np.load(path)
+    v = embed_query(DEFAULT_QUERY)
+    np.save(path, v)
+    return v
+
+
 def project_2d(
     corpus_emb: np.ndarray,
     query_emb: np.ndarray | None = None,
@@ -131,36 +253,15 @@ def project_2d(
     method: str = "pca",
     seed: int = 42,
 ):
-    """Project reviewer embeddings to 2D, placing the query and any extra points
-    (e.g. background article abstracts) in the *same* fitted space.
+    """Convenience wrapper around `fit_project` + `transform_query`.
 
-    Returns (coords[N,2], query_coord[2] or None, extra_coords[M,2] or None).
-    The reducer is fit on the reviewer corpus only, so reviewer coordinates are
-    stable; the query and extra points are transformed into that space.
-    PCA is deterministic and supports out-of-sample `.transform`. UMAP gives
-    more topical clustering if `umap-learn` is installed.
+    Returns (corpus_coords[N,2], query_coord[2] or None, extra_coords[M,2] or None).
+    Reviewers and papers are co-fit on one shared manifold (for both PCA and
+    UMAP); the query is transformed into that space.
     """
-    method = (method or "pca").lower()
-    if method == "umap":
-        try:
-            import umap  # type: ignore
-
-            reducer = umap.UMAP(n_components=2, random_state=seed, n_neighbors=15)
-            coords = reducer.fit_transform(corpus_emb)
-            q = None if query_emb is None else np.asarray(reducer.transform(query_emb.reshape(1, -1))[0])
-            ex = None if extra_emb is None else np.asarray(reducer.transform(extra_emb))
-            return np.asarray(coords), q, ex
-        except Exception:
-            # Fall back to PCA if UMAP is unavailable or fails on transform.
-            method = "pca"
-
-    from sklearn.decomposition import PCA
-
-    pca = PCA(n_components=2, random_state=seed)
-    coords = pca.fit_transform(corpus_emb)
-    q = None if query_emb is None else np.asarray(pca.transform(query_emb.reshape(1, -1))[0])
-    ex = None if extra_emb is None else np.asarray(pca.transform(extra_emb))
-    return np.asarray(coords), q, ex
+    reducer, coords, extra = fit_project(corpus_emb, extra_emb, method=method, seed=seed)
+    q = None if query_emb is None else transform_query(reducer, query_emb)
+    return coords, q, extra
 
 
 def rank_reviewers(df: pd.DataFrame, query: str, method: str = "pca") -> pd.DataFrame:
