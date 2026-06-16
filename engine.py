@@ -64,16 +64,26 @@ def load_abstracts(glob_pattern: str = ABSTRACTS_GLOB) -> pd.DataFrame:
     import glob
     import json
 
+    paths = sorted(glob.glob(glob_pattern))
+    if not paths:
+        raise FileNotFoundError(
+            f"No abstract files found matching {glob_pattern}. "
+            "Add Human_Factors_*abstracts*.json files to the data/ folder."
+        )
     rows = []
-    for path in sorted(glob.glob(glob_pattern)):
+    for path in paths:
         with open(path, "r", encoding="utf-8") as fh:
             rows.extend(json.load(fh))
     df = pd.DataFrame(rows).fillna("")
-    key = df["doi"].where(df.get("doi", "").astype(str).str.strip() != "", df.get("title", ""))
+    if df.empty:
+        raise ValueError(f"Abstract files matched {glob_pattern} but contained no records.")
+    for col in ("doi", "title", "abstract"):
+        if col not in df.columns:
+            df[col] = ""
+    key = df["doi"].where(df["doi"].astype(str).str.strip() != "", df["title"])
     df = df.loc[~key.duplicated()].reset_index(drop=True)
-    df["abstract_text"] = (df.get("title", "").astype(str) + ". "
-                           + df.get("abstract", "").astype(str)).str.strip()
-    df["title_short"] = df.get("title", "").astype(str).apply(_truncate)
+    df["abstract_text"] = (df["title"].astype(str) + ". " + df["abstract"].astype(str)).str.strip()
+    df["title_short"] = df["title"].astype(str).apply(_truncate)
     return df
 
 
@@ -97,17 +107,28 @@ def _hash_texts(texts: list[str], model_name: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _save_npy(path: str, arr: np.ndarray) -> None:
+    """Persist an array, tolerating a read-only / unwritable cache dir."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        np.save(path, arr)
+    except OSError:
+        pass  # read-only FS → recompute in memory next time, don't crash
+
+
 def embed_corpus(texts: list[str], model_name: str = MODEL_NAME) -> np.ndarray:
     """Embed reviewer profiles, caching to disk so it only runs once per corpus."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
     key = _hash_texts(texts, model_name)
     cache_file = os.path.join(CACHE_DIR, f"emb_{key}.npy")
     if os.path.exists(cache_file):
-        return np.load(cache_file)
+        try:
+            return np.load(cache_file)
+        except Exception:
+            pass  # corrupt cache → recompute
     model = get_model(model_name)
     emb = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
     emb = np.asarray(emb, dtype=np.float32)
-    np.save(cache_file, emb)
+    _save_npy(cache_file, emb)
     return emb
 
 
@@ -174,31 +195,71 @@ def transform_query(reducer, query_emb: np.ndarray) -> np.ndarray:
     return np.asarray(reducer.transform(np.asarray(query_emb).reshape(1, -1))[0])
 
 
+def _projection_key(corpus_emb, extra_emb, method: str) -> str:
+    """Cache key over the *content* of the embeddings + the projection library
+    versions, so the artifact rebuilds when the data changes (even at the same
+    row count) and is never shared across incompatible library versions."""
+    import sklearn
+
+    h = hashlib.sha256(method.encode("utf-8"))
+    h.update(np.ascontiguousarray(corpus_emb, dtype=np.float32).tobytes())
+    if extra_emb is not None:
+        h.update(np.ascontiguousarray(extra_emb, dtype=np.float32).tobytes())
+    try:
+        import umap  # type: ignore
+
+        uv = umap.__version__
+    except Exception:
+        uv = "none"
+    h.update(f"|sklearn={sklearn.__version__}|umap={uv}".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
 def load_or_build_projection(corpus_emb, extra_emb=None, method="pca", seed=42):
     """Like `fit_project`, but the fitted reducer and coordinates are persisted
     to disk, so the (slow) UMAP co-fit runs only ONCE per dataset+method ever —
-    subsequent app starts load it instantly. Cache key includes the group sizes,
-    so it rebuilds automatically when the reviewer or paper set changes.
+    subsequent app starts load it instantly.
+
+    The cache key encodes the embedding content and the sklearn/umap versions, so
+    it rebuilds when the data changes and never loads a reducer from an
+    incompatible library version. On load it also verifies the reducer type still
+    matches the requested method (e.g. won't serve a PCA reducer when UMAP is now
+    available), rebuilding if not.
 
     Returns (reducer, corpus_coords, extra_coords).
     """
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    n_extra = 0 if extra_emb is None else len(extra_emb)
-    path = os.path.join(CACHE_DIR, f"proj_{method}_{len(corpus_emb)}_{n_extra}.pkl")
+    key = _projection_key(corpus_emb, extra_emb, method)
+    path = os.path.join(CACHE_DIR, f"proj_{method}_{key}.pkl")
     if os.path.exists(path):
         try:
             with open(path, "rb") as fh:
                 d = pickle.load(fh)
-            return d["reducer"], d["corpus_coords"], d["extra_coords"]
+            if _reducer_matches(d["reducer"], method):
+                return d["reducer"], d["corpus_coords"], d["extra_coords"]
         except Exception:
             pass  # corrupt/incompatible cache → rebuild
     reducer, c, e = fit_project(corpus_emb, extra_emb, method=method, seed=seed)
     try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
         with open(path, "wb") as fh:
             pickle.dump({"reducer": reducer, "corpus_coords": c, "extra_coords": e}, fh)
-    except Exception:
-        pass  # non-fatal: just recompute next time
+    except OSError:
+        pass  # read-only FS → recompute next time, don't crash
     return reducer, c, e
+
+
+def _reducer_matches(reducer, method: str) -> bool:
+    """True if `reducer` is the kind that `method` would build right now. When
+    UMAP is unavailable, the PCA fallback is the correct match for 'umap' too."""
+    cls = type(reducer).__name__.lower()
+    if method.lower() == "umap":
+        try:
+            import umap  # noqa: F401  (only checking availability)
+
+            return "umap" in cls
+        except Exception:
+            return "pca" in cls  # umap unavailable → PCA fallback is expected
+    return "pca" in cls
 
 
 # Default manuscript shown (and ranked) on first load — kept here so both the
@@ -236,13 +297,15 @@ DEFAULT_QUERY = (
 def default_query_embedding() -> np.ndarray:
     """Embedding of DEFAULT_QUERY, persisted to disk so the initial ranked load
     needs no model in memory. Computed once (loading the model) by precompute.py."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
     key = hashlib.sha256(DEFAULT_QUERY.encode("utf-8")).hexdigest()[:16]
     path = os.path.join(CACHE_DIR, f"default_query_{key}.npy")
     if os.path.exists(path):
-        return np.load(path)
+        try:
+            return np.load(path)
+        except Exception:
+            pass  # corrupt cache → recompute
     v = embed_query(DEFAULT_QUERY)
-    np.save(path, v)
+    _save_npy(path, v)
     return v
 
 

@@ -100,9 +100,17 @@ def fit_projection(method: str, sig: tuple, _corpus, _extra):
     return engine.load_or_build_projection(_corpus, _extra, method=method)
 
 
-df = load_data()
-abstracts = load_abstracts()
-abs_emb = abstract_embeddings(tuple(abstracts["abstract_text"].tolist()))
+try:
+    df = load_data()
+    abstracts = load_abstracts()
+    abs_emb = abstract_embeddings(tuple(abstracts["abstract_text"].tolist()))
+except Exception as exc:  # missing/malformed data files → clear message, not a stack trace
+    st.error(
+        "Could not load data from the `data/` folder "
+        f"({type(exc).__name__}: {exc}). Ensure `members_enriched.csv` and the "
+        "`Human_Factors_*abstracts*.json` files are present."
+    )
+    st.stop()
 
 # Seed the default manuscript (defined in engine, shared with precompute.py).
 for _k in ("query", "query_input"):
@@ -199,7 +207,7 @@ else:
     enc["size"] = alt.value(140)
     enc["color"] = alt.value("#4c78a8")
 
-# Background "field" of the last 500 Human Factors article abstracts.
+# Background "field" of recent Human Factors article abstracts.
 background = (
     alt.Chart(abs_df)
     .mark_circle(size=20, color="#d4d4d8", opacity=0.45)

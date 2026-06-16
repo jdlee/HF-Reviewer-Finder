@@ -1,5 +1,11 @@
 .venv/
 __pycache__/
 *.pyc
-data/.cache/
 .DS_Store
+
+# Ignore the cache dir contents, but commit the precomputed deploy artifacts
+# (embeddings, PCA/UMAP projections, default-query vector) for fast cold starts.
+data/.cache/*
+!data/.cache/emb_*.npy
+!data/.cache/proj_*.pkl
+!data/.cache/default_query_*.npy

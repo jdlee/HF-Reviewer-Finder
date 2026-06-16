@@ -1,8 +1,10 @@
-streamlit>=1.30
-altair>=5.0
-pandas>=2.0
-numpy>=1.24
-scikit-learn>=1.3
-sentence-transformers>=2.2
+# Pinned with floors at the tested versions and ceilings below the next major,
+# so deploys are reproducible without breaking on a future major release.
+streamlit>=1.40,<2
+altair>=5,<7
+pandas>=2,<4
+numpy>=1.24,<3
+scikit-learn>=1.3,<2
+sentence-transformers>=2.2,<6
 # Optional: tighter topical clustering in the 2D map (app falls back to PCA if absent)
-umap-learn>=0.5
+umap-learn>=0.5,<0.6
