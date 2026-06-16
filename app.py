@@ -10,6 +10,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -91,13 +92,14 @@ def abstract_embeddings(texts: tuple[str, ...]):
     return engine.embed_corpus(list(texts))
 
 
-@st.cache_resource(show_spinner="Building 2D projection (co-fitting reviewers + papers)…")
-def fit_projection(method: str, sig: tuple, _corpus, _extra):
-    """Co-fit reviewers + papers once per method; cached across reruns.
-    `sig` (hashed) invalidates the cache if the data changes; `_corpus`/`_extra`
-    are large arrays passed unhashed. Reducer + coords are also persisted to disk
-    so the slow UMAP co-fit survives app restarts."""
-    return engine.load_or_build_projection(_corpus, _extra, method=method)
+@st.cache_data(show_spinner="Building 2D projection (co-fitting reviewers + papers)…")
+def projection_coords(method: str, sig: tuple, _corpus, _extra):
+    """Co-fit reviewers + papers coordinates once per method; cached across reruns
+    and persisted to disk as portable .npz. `sig` (hashed) invalidates on data
+    change; `_corpus`/`_extra` are large arrays passed unhashed. Returns only
+    coordinates (no reducer), so the runtime never needs numba/UMAP at request
+    time — the query is placed with engine.place_query."""
+    return engine.load_or_build_projection_coords(_corpus, _extra, method=method)
 
 
 try:
@@ -158,13 +160,15 @@ st.caption(
 
 # ---- Compute (map always; ranking only when a query is present) ---------- #
 corpus = corpus_embeddings(tuple(df["profile_text"].tolist()))
-# Reviewers + papers are co-fit on one shared manifold (cached per method);
-# the manuscript is transformed into that same space per query.
-reducer, coords, abs_coords = fit_projection(method, (len(df), len(abstracts)), corpus, abs_emb)
+# Reviewers + papers are co-fit on one shared manifold (coords cached per method).
+coords, abs_coords = projection_coords(method, (len(df), len(abstracts)), corpus, abs_emb)
 if has_query:
     q = query_vec(query)  # default query is precomputed; others load the model lazily
     sims = engine.cosine_similarity(corpus, q)
-    qcoord = engine.transform_query(reducer, q)
+    # Numba-free placement of the manuscript marker (no UMAP at request time).
+    fit_emb = np.vstack([corpus, abs_emb])
+    fit_coords = np.vstack([coords, abs_coords])
+    qcoord = engine.place_query(q, fit_emb, fit_coords)
 else:
     qcoord = None
 

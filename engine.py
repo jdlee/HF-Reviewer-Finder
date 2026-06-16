@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import pickle
 from functools import lru_cache
 
 import numpy as np
@@ -195,71 +194,62 @@ def transform_query(reducer, query_emb: np.ndarray) -> np.ndarray:
     return np.asarray(reducer.transform(np.asarray(query_emb).reshape(1, -1))[0])
 
 
-def _projection_key(corpus_emb, extra_emb, method: str) -> str:
-    """Cache key over the *content* of the embeddings + the projection library
-    versions, so the artifact rebuilds when the data changes (even at the same
-    row count) and is never shared across incompatible library versions."""
-    import sklearn
-
+def _coords_key(corpus_emb, extra_emb, method: str) -> str:
+    """Content hash of the embeddings + method. Coordinates are plain numbers, so
+    (unlike a pickled reducer) they are portable across library/Python versions —
+    no version needs to be in the key."""
     h = hashlib.sha256(method.encode("utf-8"))
     h.update(np.ascontiguousarray(corpus_emb, dtype=np.float32).tobytes())
     if extra_emb is not None:
         h.update(np.ascontiguousarray(extra_emb, dtype=np.float32).tobytes())
-    try:
-        import umap  # type: ignore
-
-        uv = umap.__version__
-    except Exception:
-        uv = "none"
-    h.update(f"|sklearn={sklearn.__version__}|umap={uv}".encode("utf-8"))
     return h.hexdigest()[:16]
 
 
-def load_or_build_projection(corpus_emb, extra_emb=None, method="pca", seed=42):
-    """Like `fit_project`, but the fitted reducer and coordinates are persisted
-    to disk, so the (slow) UMAP co-fit runs only ONCE per dataset+method ever —
-    subsequent app starts load it instantly.
+def load_or_build_projection_coords(corpus_emb, extra_emb=None, method="pca", seed=42):
+    """Return (corpus_coords, extra_coords) for the 2D map, persisted as a portable
+    .npz so the RUNTIME never unpickles a version-sensitive reducer or runs numba.
 
-    The cache key encodes the embedding content and the sklearn/umap versions, so
-    it rebuilds when the data changes and never loads a reducer from an
-    incompatible library version. On load it also verifies the reducer type still
-    matches the requested method (e.g. won't serve a PCA reducer when UMAP is now
-    available), rebuilding if not.
-
-    Returns (reducer, corpus_coords, extra_coords).
+    Building the coordinates (when the .npz is absent) needs the projection libs
+    and — for UMAP — numba; that is meant to happen offline in precompute.py on a
+    supported Python. If a UMAP build fails at runtime (e.g. numba unavailable on
+    a too-new Python), it degrades to PCA coordinates instead of crashing. The
+    manuscript point is later placed with the numba-free `place_query`, so no
+    fitted reducer is needed at request time.
     """
-    key = _projection_key(corpus_emb, extra_emb, method)
-    path = os.path.join(CACHE_DIR, f"proj_{method}_{key}.pkl")
+    key = _coords_key(corpus_emb, extra_emb, method)
+    path = os.path.join(CACHE_DIR, f"coords_{method}_{key}.npz")
     if os.path.exists(path):
         try:
-            with open(path, "rb") as fh:
-                d = pickle.load(fh)
-            if _reducer_matches(d["reducer"], method):
-                return d["reducer"], d["corpus_coords"], d["extra_coords"]
+            d = np.load(path)
+            extra = d["extra"] if d["extra"].size else None
+            return d["corpus"], extra
         except Exception:
-            pass  # corrupt/incompatible cache → rebuild
-    reducer, c, e = fit_project(corpus_emb, extra_emb, method=method, seed=seed)
+            pass  # corrupt cache → rebuild
+    try:
+        _, c, e = fit_project(corpus_emb, extra_emb, method=method, seed=seed)
+    except Exception:
+        _, c, e = fit_project(corpus_emb, extra_emb, method="pca", seed=seed)
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(path, "wb") as fh:
-            pickle.dump({"reducer": reducer, "corpus_coords": c, "extra_coords": e}, fh)
+        np.savez(path, corpus=np.asarray(c), extra=(np.asarray(e) if e is not None else np.empty((0, 2))))
     except OSError:
         pass  # read-only FS → recompute next time, don't crash
-    return reducer, c, e
+    return c, e
 
 
-def _reducer_matches(reducer, method: str) -> bool:
-    """True if `reducer` is the kind that `method` would build right now. When
-    UMAP is unavailable, the PCA fallback is the correct match for 'umap' too."""
-    cls = type(reducer).__name__.lower()
-    if method.lower() == "umap":
-        try:
-            import umap  # noqa: F401  (only checking availability)
-
-            return "umap" in cls
-        except Exception:
-            return "pca" in cls  # umap unavailable → PCA fallback is expected
-    return "pca" in cls
+def place_query(query_emb, fit_emb, fit_coords, k: int = 15) -> np.ndarray:
+    """Numba-free placement of the manuscript point in an existing 2D layout:
+    the cosine-similarity-weighted average of the 2D coordinates of its k nearest
+    co-fit points. Works identically for PCA and UMAP layouts and — crucially for
+    deployment — needs no fitted reducer (so it never triggers UMAP/numba)."""
+    q = np.asarray(query_emb, dtype=np.float32).ravel()
+    fe = np.asarray(fit_emb, dtype=np.float32)
+    sims = fe @ q
+    k = min(k, len(sims))
+    idx = np.argpartition(sims, -k)[-k:]
+    w = np.clip(sims[idx], 1e-6, None)
+    w = w / w.sum()
+    return (w[:, None] * np.asarray(fit_coords, dtype=np.float64)[idx]).sum(axis=0)
 
 
 # Default manuscript shown (and ranked) on first load — kept here so both the

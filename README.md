@@ -41,11 +41,15 @@ python precompute.py
 
 After this the app starts in ~1 s with no model load and no projection fitting;
 it just reads the cached artifacts from `data/.cache/`. The current artifacts are
-**committed to the repo** (~3.4 MB) so a fresh clone/deploy is fast out of the box.
-Re-run `precompute.py` whenever you change `members_enriched.csv` or add abstract
-batches — the caches are keyed by embedding **content** and library versions, so
-they rebuild automatically when the data or `scikit-learn`/`umap-learn` versions
-change (re-run, then commit the regenerated `data/.cache/*` artifacts).
+**committed to the repo** (~2 MB) so a fresh clone/deploy is fast out of the box.
+Caches are keyed by embedding **content**, so re-running `precompute.py` after you
+change `members_enriched.csv` or add abstract batches rebuilds only what changed;
+then commit the regenerated `data/.cache/*` artifacts.
+
+To rebuild the **UMAP** coordinates you need `umap-learn` installed locally (it's
+not in `requirements.txt`): `pip install "umap-learn>=0.5,<0.6"`, then
+`python precompute.py`. Without it, `precompute.py` falls back to PCA coords for
+the UMAP map.
 
 ## Run
 
@@ -78,20 +82,31 @@ automatically (re-run `precompute.py` afterward).
 
 ## Deployment
 
-- **Pinned dependencies** (`requirements.txt`) and **`.python-version`** (3.11) keep
-  deploys reproducible. The stack includes `torch` (via sentence-transformers), so
-  the install is large (~hundreds of MB) and needs a host with adequate RAM.
+Tested on Streamlit Community Cloud (repo: `app.py`, branch `master`).
+
+- **Numba-free at runtime.** The UMAP map is served from precomputed coordinates
+  (committed `.npz`) and the manuscript marker is placed with a numpy k-NN method,
+  so the deployed app never imports `umap`/`numba`. `umap-learn` is therefore *not*
+  a runtime dependency (it's only needed locally to rebuild UMAP coords). This
+  avoids numba's lag behind new Python releases — e.g. **Python 3.14**, where numba
+  cannot JIT and a UMAP `.transform` would crash.
+- **Python version:** for extra safety, set Python **3.13** in the Streamlit Cloud
+  app's *Advanced settings* (Cloud does not read `.python-version`). The app also
+  runs on 3.14 thanks to the numba-free design.
+- **Pinned dependencies** (`requirements.txt`) keep deploys reproducible. The stack
+  includes `torch` (via sentence-transformers), so the install is large
+  (~hundreds of MB) and needs a host with adequate RAM.
 - **Committed artifacts** mean a cold start does *not* download the model, embed
-  1,075 texts, or fit UMAP at first request — it reads `data/.cache/*`. Only a
-  *custom* manuscript (different from the default) lazily loads the model to embed it,
-  so a deploy that should never load the model can keep the input on the default.
+  1,075 texts, or fit any projection at first request — it reads `data/.cache/*`.
+  Only a *custom* manuscript (different from the default) lazily loads the model to
+  embed it, so a deploy that should never load the model can keep to the default.
 - The cache directory is written lazily and **degrades gracefully on a read-only or
   ephemeral filesystem** (recomputes in memory instead of crashing).
 - Missing/malformed data files surface a clear in-app error rather than a stack trace.
 
 ## Notes
 
-- UMAP is optional; if `umap-learn` isn't installed (or its transform fails), the
-  map falls back to PCA automatically.
+- UMAP is optional at build time; if `umap-learn` isn't installed when (re)building
+  coords, the UMAP map falls back to PCA coordinates automatically.
 - Embeddings and projections are cached by a content hash, so editing the CSV (even
   with the same number of rows) triggers a one-time re-embed and re-projection.

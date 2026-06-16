@@ -29,8 +29,8 @@ def main() -> None:
 
     for method in ("pca", "umap"):
         t = time.time()
-        engine.load_or_build_projection(remb, aemb, method=method)
-        print(f"projection '{method}' built/cached in {time.time() - t:.1f}s")
+        engine.load_or_build_projection_coords(remb, aemb, method=method)
+        print(f"projection coords '{method}' built/cached in {time.time() - t:.1f}s")
 
     engine.default_query_embedding()
     print("default-query embedding cached")

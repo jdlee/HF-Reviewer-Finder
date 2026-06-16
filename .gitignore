@@ -4,8 +4,10 @@ __pycache__/
 .DS_Store
 
 # Ignore the cache dir contents, but commit the precomputed deploy artifacts
-# (embeddings, PCA/UMAP projections, default-query vector) for fast cold starts.
+# (embeddings, PCA/UMAP projection coordinates, default-query vector) for fast,
+# numba-free cold starts. Coordinates are stored as portable .npz (not pickled
+# reducers) so they load on any Python/library version.
 data/.cache/*
 !data/.cache/emb_*.npy
-!data/.cache/proj_*.pkl
+!data/.cache/coords_*.npz
 !data/.cache/default_query_*.npy
