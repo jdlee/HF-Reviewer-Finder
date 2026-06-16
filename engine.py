@@ -19,6 +19,7 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(HERE, "data", "members_enriched.csv")
+ABSTRACTS_GLOB = os.path.join(HERE, "data", "Human_Factors_*abstracts*.json")
 CACHE_DIR = os.path.join(HERE, "data", ".cache")
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -54,6 +55,25 @@ def load_members(path: str = DATA_PATH) -> pd.DataFrame:
 def _truncate(text: str, n: int = 220) -> str:
     text = str(text).strip()
     return text if len(text) <= n else text[: n - 1].rstrip() + "…"
+
+
+def load_abstracts(glob_pattern: str = ABSTRACTS_GLOB) -> pd.DataFrame:
+    """Load all Human Factors article-abstract batches in the data folder
+    (title + abstract per row), concatenated and de-duplicated by DOI/title."""
+    import glob
+    import json
+
+    rows = []
+    for path in sorted(glob.glob(glob_pattern)):
+        with open(path, "r", encoding="utf-8") as fh:
+            rows.extend(json.load(fh))
+    df = pd.DataFrame(rows).fillna("")
+    key = df["doi"].where(df.get("doi", "").astype(str).str.strip() != "", df.get("title", ""))
+    df = df.loc[~key.duplicated()].reset_index(drop=True)
+    df["abstract_text"] = (df.get("title", "").astype(str) + ". "
+                           + df.get("abstract", "").astype(str)).str.strip()
+    df["title_short"] = df.get("title", "").astype(str).apply(_truncate)
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -106,13 +126,17 @@ def cosine_similarity(corpus_emb: np.ndarray, query_emb: np.ndarray) -> np.ndarr
 
 def project_2d(
     corpus_emb: np.ndarray,
-    query_emb: np.ndarray,
+    query_emb: np.ndarray | None = None,
+    extra_emb: np.ndarray | None = None,
     method: str = "pca",
     seed: int = 42,
 ):
-    """Project reviewer embeddings to 2D and place the query in the same space.
+    """Project reviewer embeddings to 2D, placing the query and any extra points
+    (e.g. background article abstracts) in the *same* fitted space.
 
-    Returns (coords[N,2], query_coord[2]).
+    Returns (coords[N,2], query_coord[2] or None, extra_coords[M,2] or None).
+    The reducer is fit on the reviewer corpus only, so reviewer coordinates are
+    stable; the query and extra points are transformed into that space.
     PCA is deterministic and supports out-of-sample `.transform`. UMAP gives
     more topical clustering if `umap-learn` is installed.
     """
@@ -123,8 +147,9 @@ def project_2d(
 
             reducer = umap.UMAP(n_components=2, random_state=seed, n_neighbors=15)
             coords = reducer.fit_transform(corpus_emb)
-            q = reducer.transform(query_emb.reshape(1, -1))[0]
-            return np.asarray(coords), np.asarray(q)
+            q = None if query_emb is None else np.asarray(reducer.transform(query_emb.reshape(1, -1))[0])
+            ex = None if extra_emb is None else np.asarray(reducer.transform(extra_emb))
+            return np.asarray(coords), q, ex
         except Exception:
             # Fall back to PCA if UMAP is unavailable or fails on transform.
             method = "pca"
@@ -133,8 +158,9 @@ def project_2d(
 
     pca = PCA(n_components=2, random_state=seed)
     coords = pca.fit_transform(corpus_emb)
-    q = pca.transform(query_emb.reshape(1, -1))[0]
-    return np.asarray(coords), np.asarray(q)
+    q = None if query_emb is None else np.asarray(pca.transform(query_emb.reshape(1, -1))[0])
+    ex = None if extra_emb is None else np.asarray(pca.transform(extra_emb))
+    return np.asarray(coords), q, ex
 
 
 def rank_reviewers(df: pd.DataFrame, query: str, method: str = "pca") -> pd.DataFrame:
@@ -143,7 +169,7 @@ def rank_reviewers(df: pd.DataFrame, query: str, method: str = "pca") -> pd.Data
     corpus = embed_corpus(texts)
     q = embed_query(query)
     sims = cosine_similarity(corpus, q)
-    coords, qcoord = project_2d(corpus, q, method=method)
+    coords, qcoord, _ = project_2d(corpus, q, method=method)
 
     out = df.copy()
     out["similarity"] = sims

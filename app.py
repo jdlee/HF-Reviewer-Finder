@@ -15,33 +15,47 @@ import streamlit as st
 
 import engine
 
-st.set_page_config(page_title="HF Reviewer Finder", layout="wide")
+st.set_page_config(
+    page_title="HF Reviewer Finder",
+    page_icon="🔍",
+    layout="wide",
+)
 
-EXAMPLES = {
-    "— pick an example —": "",
-    "Trust in driving automation": (
-        "Drivers' trust in and reliance on advanced driver-assistance systems during "
-        "conditionally automated driving. We examine how takeover request timing and "
-        "modality affect situation awareness, attention allocation, and reliance "
-        "calibration in a high-fidelity driving simulator."
-    ),
-    "Occupational ergonomics / exoskeletons": (
-        "Effects of a passive back-support exoskeleton on lumbar muscle activity, "
-        "spinal loading, and perceived exertion during repetitive manual material "
-        "handling. Surface EMG and motion capture quantify musculoskeletal disorder "
-        "risk reduction in a simulated warehouse task."
-    ),
-    "Human-AI teaming": (
-        "Coordination and shared mental models in human-autonomy teams performing a "
-        "collaborative search-and-rescue task. We assess how an AI teammate's "
-        "communication transparency shapes team performance, trust, and workload."
-    ),
-    "Healthcare human factors": (
-        "A usability and workload evaluation of an electronic health record alerting "
-        "interface in the emergency department, examining alarm fatigue, interruption "
-        "recovery, and clinician decision-making under time pressure."
-    ),
-}
+# ---- Apple-HIG-inspired styling: clarity, deference, depth ---------------- #
+st.markdown(
+    """
+    <style>
+    :root { --hig-accent:#0071e3; --hig-radius:14px; }
+    html, body, [class*="css"], .stMarkdown, textarea, input, select, button {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                     "Helvetica Neue", Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+    }
+    .block-container { padding-top: 2.4rem; padding-bottom: 4rem; max-width: 1320px; }
+    h1 { font-weight: 700; letter-spacing: -0.022em; }
+    h2, h3 { font-weight: 600; letter-spacing: -0.012em; }
+    /* Primary submit button — Apple capsule style */
+    .stFormSubmitButton button {
+        background: var(--hig-accent); color:#fff; border:none;
+        border-radius: 980px; padding: 0.6rem 1.2rem; font-weight: 600;
+        transition: background .15s ease, transform .05s ease;
+    }
+    .stFormSubmitButton button:hover { background:#0077ed; color:#fff; }
+    .stFormSubmitButton button:active { transform: scale(0.98); }
+    /* Soft rounded surfaces */
+    .stTextArea textarea { border-radius: var(--hig-radius); }
+    [data-testid="stDataFrame"],
+    [data-testid="stVerticalBlockBorderWrapper"] { border-radius: var(--hig-radius); }
+    [data-testid="stSidebar"] { border-right: 1px solid #e8e8ed; }
+    /* Quieter captions */
+    [data-testid="stCaptionContainer"] { color:#6e6e73; }
+    /* Cleaner app chrome (deference) */
+    [data-testid="stDecoration"] { display:none; }
+    #MainMenu, footer { visibility:hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_data(show_spinner=False)
@@ -64,109 +78,190 @@ def query_vec(text: str):
     return engine.embed_query(text)
 
 
+@st.cache_data(show_spinner=False)
+def load_abstracts() -> pd.DataFrame:
+    return engine.load_abstracts()
+
+
+@st.cache_data(show_spinner="Embedding background article abstracts…")
+def abstract_embeddings(texts: tuple[str, ...]):
+    return engine.embed_corpus(list(texts))
+
+
 df = load_data()
+abstracts = load_abstracts()
+abs_emb = abstract_embeddings(tuple(abstracts["abstract_text"].tolist()))
 
-st.title("🔍 HF Reviewer Finder")
-st.caption(
-    f"Map and rank the {len(df)} *Human Factors* journal reviewers by how closely their "
-    "expertise matches a manuscript. Matching uses local sentence-transformer embeddings "
-    "of each reviewer's expertise overview and key publications."
+# Default manuscript shown (and ranked) on first load.
+DEFAULT_QUERY = (
+    "Research on trust in generative and agentic AI has focused on system "
+    "trustworthiness and user adoption, neglecting the cognitive mechanisms that "
+    "govern how people calibrate trust in systems that are probabilistic, opaque, "
+    "and socially legible. The central question is not whether AI is trusted or "
+    "trustworthy, but whether it is trustable: designed so people can form, "
+    "maintain, and revise warranted trust. Calibration matches trust to capability; "
+    "warrant grounds it in the actual causes of capability. A computational review "
+    "of 2,342 papers and a narrative synthesis identify characteristics "
+    "distinguishing generative and agentic AI from traditional automation. We "
+    "identify 14 trust-relevant characteristics and organize them by three "
+    "challenges: calibration (how much to trust), comprehension (what is being "
+    "trusted), and boundary (where AI’s contribution ends and the person’s begins). "
+    "These characteristics disrupt trust calibration through four cognitive "
+    "mechanisms: attribution, by impoverishing covariation information; construal "
+    "level, by widening psychological distance; sensemaking, by stabilizing initial "
+    "frames against revision; and anthropomorphism, by activating human-oriented "
+    "social cognition. Together, these mechanisms drive the person’s attributional "
+    "hierarchy out of alignment with the AI's functional abstraction hierarchy; "
+    "misalignment produces miscalibration. We propose cross-hierarchy alignment as "
+    "the central design construct for trustable AI, which defines strategies for "
+    "functional anthropomorphism in interface design, and for role and relationship "
+    "engineering—operationalized through 11 design principles. Panarchy theory "
+    "extends the analysis to sociotechnical systems, showing how attributional bleed "
+    "may propagate miscalibration to institutional and societal scales. Trustable AI "
+    "requires designing the human-AI ecology that shapes trust, not only the model, "
+    "interface, or dyadic interaction."
 )
+for _k in ("query", "query_input"):
+    if _k not in st.session_state:
+        st.session_state[_k] = DEFAULT_QUERY
 
-# ---- Sidebar controls ---------------------------------------------------- #
+# ---- Sidebar: manuscript description (the query input) ------------------- #
 with st.sidebar:
-    st.header("Controls")
+    st.header("Manuscript description")
+    with st.form("query_form", border=False):
+        st.text_area(
+            "Manuscript description",
+            height=300,
+            key="query_input",
+            label_visibility="collapsed",
+            placeholder="Enter the manuscript's title, abstract, or any description of its content…",
+        )
+        submitted = st.form_submit_button(
+            "Find reviewers", type="primary", use_container_width=True
+        )
+    if submitted:
+        st.session_state["query"] = st.session_state.get("query_input", "")
+    st.divider()
     method = st.radio(
         "2D projection", ["pca", "umap"], index=0,
         help="PCA is fast & deterministic. UMAP clusters topics more tightly "
              "(requires umap-learn; falls back to PCA if unavailable).",
     )
-    ranks = sorted(df["rank"].unique())
-    rank_filter = st.multiselect(
-        "Reviewer roles", ranks, default=ranks,
-        help="AE=Associate Editor · EB=Editorial Board · R=Reviewer · PR=Past/Provisional Reviewer",
-    )
-    top_n = st.slider("Show top N in table", 5, len(df), 20)
-    st.divider()
     st.caption("Citations are LLM-researched from the web — verify before formal use.")
 
-# ---- Query input --------------------------------------------------------- #
-ex = st.selectbox("Load an example", list(EXAMPLES.keys()))
-default_text = EXAMPLES.get(ex, "")
-query = st.text_area(
-    "Manuscript text (title + abstract, or any topic description)",
-    value=default_text,
-    height=160,
-    placeholder="Paste a manuscript title and abstract here…",
+query = st.session_state.get("query", "")
+has_query = bool(query.strip())
+
+st.title(f"🔍 HF Reviewer Finder: {len(df)} reviewers mapped and ranked")
+st.caption(
+    "Local sentence-transformer embeddings of each *Human Factors* reviewer's expertise and "
+    "key publications, ranked against your manuscript."
+)
+st.caption(
+    "Each point is a reviewer, positioned by expertise. "
+    + ("The red circle is your manuscript; closer + brighter = better topical match."
+       if has_query else
+       "Enter a manuscript description in the sidebar to rank reviewers by relevance.")
 )
 
-if not query.strip():
-    st.info("Enter manuscript text above (or load an example) to find matching reviewers.")
-    st.stop()
-
-# ---- Compute ------------------------------------------------------------- #
-_model()  # warm the model cache (shows spinner once)
+# ---- Compute (map always; ranking only when a query is present) ---------- #
 corpus = corpus_embeddings(tuple(df["profile_text"].tolist()))
-q = query_vec(query)
+if has_query:
+    _model()  # warm the model cache (shows spinner once)
+    q = query_vec(query)
+    sims = engine.cosine_similarity(corpus, q)
+    coords, qcoord, abs_coords = engine.project_2d(corpus, q, extra_emb=abs_emb, method=method)
+else:
+    coords, qcoord, abs_coords = engine.project_2d(corpus, None, extra_emb=abs_emb, method=method)
 
-sims = engine.cosine_similarity(corpus, q)
-coords, qcoord = engine.project_2d(corpus, q, method=method)
+abs_df = pd.DataFrame({
+    "x": abs_coords[:, 0],
+    "y": abs_coords[:, 1],
+    "title": abstracts["title_short"].values,
+})
 
 view = df.copy()
-view["similarity"] = sims
 view["x"] = coords[:, 0]
 view["y"] = coords[:, 1]
-view = view[view["rank"].isin(rank_filter)].copy()
-view = view.sort_values("similarity", ascending=False).reset_index(drop=True)
+if has_query:
+    view["similarity"] = sims
+    view = view.sort_values("similarity", ascending=False).reset_index(drop=True)
+else:
+    view = view.sort_values("name").reset_index(drop=True)
 view.insert(0, "match_rank", view.index + 1)
 
-# ---- 2D semantic map ----------------------------------------------------- #
-st.subheader("Semantic map")
-st.caption("Each point is a reviewer; the ★ is your manuscript. Closer + brighter = better topical match.")
+# ---- 2D semantic map (visible on load) ----------------------------------- #
+enc = dict(
+    x=alt.X("x:Q", axis=None, scale=alt.Scale(zero=False)),
+    y=alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False)),
+    tooltip=[
+        alt.Tooltip("name:N", title="Reviewer"),
+        alt.Tooltip("rank:N", title="Role"),
+        *([alt.Tooltip("similarity:Q", title="Similarity", format=".2f")] if has_query else []),
+        alt.Tooltip("expertise_short:N", title="Expertise"),
+    ],
+)
+if has_query:
+    sim_domain = [float(view["similarity"].min()), float(view["similarity"].max())]
+    enc["size"] = alt.Size("similarity:Q", scale=alt.Scale(range=[40, 600]), legend=None)
+    enc["color"] = alt.Color(
+        "similarity:Q",
+        scale=alt.Scale(scheme="viridis", domain=sim_domain),
+        legend=alt.Legend(title="Similarity"),
+    )
+else:
+    enc["size"] = alt.value(140)
+    enc["color"] = alt.value("#4c78a8")
 
-sim_domain = [float(view["similarity"].min()), float(view["similarity"].max())]
-points = (
-    alt.Chart(view)
-    .mark_circle(opacity=0.85)
+# Background "field" of the last 500 Human Factors article abstracts.
+background = (
+    alt.Chart(abs_df)
+    .mark_circle(size=20, color="#d4d4d8", opacity=0.45)
     .encode(
         x=alt.X("x:Q", axis=None, scale=alt.Scale(zero=False)),
         y=alt.Y("y:Q", axis=None, scale=alt.Scale(zero=False)),
-        size=alt.Size("similarity:Q", scale=alt.Scale(range=[40, 600]), legend=None),
-        color=alt.Color(
-            "similarity:Q",
-            scale=alt.Scale(scheme="viridis", domain=sim_domain),
-            legend=alt.Legend(title="Similarity"),
-        ),
-        tooltip=[
-            alt.Tooltip("name:N", title="Reviewer"),
-            alt.Tooltip("rank:N", title="Role"),
-            alt.Tooltip("similarity:Q", title="Similarity", format=".3f"),
-            alt.Tooltip("expertise_short:N", title="Expertise"),
-        ],
+        tooltip=alt.Tooltip("title:N", title="Recent HF article"),
     )
 )
-labels = (
-    alt.Chart(view.head(12))
-    .mark_text(align="left", dx=8, dy=0, fontSize=10, color="#333")
-    .encode(x="x:Q", y="y:Q", text="name:N")
+points = alt.Chart(view).mark_circle(opacity=0.85).encode(**enc)
+layers = [background, points]
+if has_query:
+    labels = (
+        alt.Chart(view.head(12))
+        .mark_text(align="left", dx=8, dy=0, fontSize=10, color="#333")
+        .encode(x="x:Q", y="y:Q", text="name:N")
+    )
+    query_df = pd.DataFrame({"x": [qcoord[0]], "y": [qcoord[1]], "label": ["Manuscript"]})
+    submission = (
+        alt.Chart(query_df)
+        .mark_point(shape="circle", size=520, color="#ff3b30", filled=True, stroke="white", strokeWidth=1.5)
+        .encode(x="x:Q", y="y:Q", tooltip=alt.value("Manuscript"))
+    )
+    submission_label = (
+        alt.Chart(query_df)
+        .mark_text(align="center", dy=-18, fontSize=12, fontWeight="bold", color="#ff3b30")
+        .encode(x="x:Q", y="y:Q", text="label:N")
+    )
+    layers += [labels, submission, submission_label]
+
+# No .interactive() — zoom/pan disabled.
+chart = (
+    alt.layer(*layers)
+    .properties(height=520)
+    .configure_view(strokeWidth=0)
+    .configure(font="-apple-system, BlinkMacSystemFont, 'SF Pro Text', Helvetica, sans-serif")
+    .configure_legend(titleFontWeight="normal", labelColor="#6e6e73", titleColor="#6e6e73")
 )
-query_df = pd.DataFrame({"x": [qcoord[0]], "y": [qcoord[1]], "label": ["YOUR TEXT"]})
-star = (
-    alt.Chart(query_df)
-    .mark_point(shape="triangle-up", size=400, color="crimson", filled=True, stroke="black")
-    .encode(x="x:Q", y="y:Q", tooltip=alt.value("Your manuscript text"))
-)
-star_label = (
-    alt.Chart(query_df)
-    .mark_text(align="center", dy=-16, fontSize=12, fontWeight="bold", color="crimson")
-    .encode(x="x:Q", y="y:Q", text="label:N")
-)
-chart = (points + labels + star + star_label).properties(height=520).interactive()
 st.altair_chart(chart, use_container_width=True)
 
-# ---- Ranked table -------------------------------------------------------- #
-st.subheader(f"Top {min(top_n, len(view))} matching reviewers")
-table = view.head(top_n)[
+if not has_query:
+    st.stop()
+
+# ---- Ranked table (top 20, scrollable ~8 rows; select a row for details) - #
+TABLE_N = 20
+st.subheader(f"Top {min(TABLE_N, len(view))} ranked reviewers")
+st.caption("Select a row to see that reviewer's details below.")
+table = view.head(TABLE_N)[
     ["match_rank", "name", "rank", "similarity", "expertise_short", "top_recent"]
 ].rename(
     columns={
@@ -178,24 +273,33 @@ table = view.head(top_n)[
         "top_recent": "Most recent publication",
     }
 )
-st.dataframe(
+# Pre-select the top-ranked reviewer the first time the table renders.
+if "rev_table" not in st.session_state:
+    st.session_state["rev_table"] = {"selection": {"rows": [0], "columns": []}}
+event = st.dataframe(
     table,
+    key="rev_table",
     hide_index=True,
     use_container_width=True,
+    height=315,  # ~8 rows + header, then scrolls
+    on_select="rerun",
+    selection_mode="single-row",
     column_config={
         "Similarity": st.column_config.ProgressColumn(
             "Similarity", min_value=0.0, max_value=float(view["similarity"].max()),
-            format="%.3f",
+            format="%.2f",
         ),
     },
 )
 
-# ---- Per-reviewer detail ------------------------------------------------- #
-with st.expander("Reviewer detail"):
-    who = st.selectbox("Reviewer", view["name"].tolist())
-    row = view[view["name"] == who].iloc[0]
-    st.markdown(f"### {row['name']}  ·  _{row['rank']}_  ·  similarity **{row['similarity']:.3f}**")
-    st.markdown(f"**Expertise.** {row['expertise_overview']}")
+# ---- Detailed reviewer information (driven by table selection) ---------- #
+sel = list(event.selection.rows) if getattr(event, "selection", None) else []
+idx = sel[0] if sel else 0
+row = view.iloc[idx]
+st.subheader("Reviewer details")
+with st.container(border=True):
+    st.markdown(f"**{row['name']}**  ·  _{row['rank']}_  ·  similarity **{row['similarity']:.2f}**")
+    st.markdown(f"_{row['expertise_overview']}_")
     st.markdown("**Recent publications**")
     for i in (1, 2, 3):
         cit, syn = row.get(f"recent_{i}", ""), row.get(f"recent_{i}_synopsis", "")
