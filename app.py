@@ -152,7 +152,8 @@ st.caption(
     "key publications, ranked against your manuscript."
 )
 st.caption(
-    "Each point is a reviewer, positioned by expertise. "
+    "Each point is a reviewer, positioned by expertise; open circles are prolific "
+    "authors not on the editorial board. "
     + ("The red circle is your manuscript; closer + brighter = better topical match."
        if has_query else
        "Enter a manuscript description in the sidebar to rank reviewers by relevance.")
@@ -201,15 +202,26 @@ enc = dict(
 )
 if has_query:
     sim_domain = [float(view["similarity"].min()), float(view["similarity"].max())]
-    enc["size"] = alt.Size("similarity:Q", scale=alt.Scale(range=[40, 600]), legend=None)
-    enc["color"] = alt.Color(
-        "similarity:Q",
-        scale=alt.Scale(scheme="viridis", domain=sim_domain),
-        legend=alt.Legend(title="Similarity"),
-    )
-else:
-    enc["size"] = alt.value(140)
-    enc["color"] = alt.value("#4c78a8")
+
+
+def _size_enc(size_range: list[int], flat: int):
+    """Size by similarity when ranking, else a flat size. Non-EB layers pass a
+    smaller range/flat value so they read as secondary."""
+    if has_query:
+        return alt.Size("similarity:Q", scale=alt.Scale(range=size_range), legend=None)
+    return alt.value(flat)
+
+
+def _color_enc(show_legend: bool):
+    """Shared viridis-by-similarity scale; only one layer shows the legend."""
+    if has_query:
+        return alt.Color(
+            "similarity:Q",
+            scale=alt.Scale(scheme="viridis", domain=sim_domain),
+            legend=alt.Legend(title="Similarity") if show_legend else None,
+        )
+    return alt.value("#4c78a8")
+
 
 # Background "field" of recent Human Factors article abstracts.
 background = (
@@ -221,8 +233,23 @@ background = (
         tooltip=alt.Tooltip("title:N", title="Recent HF article"),
     )
 )
-points = alt.Chart(view).mark_circle(opacity=0.85).encode(**enc)
-layers = [background, points]
+
+# Reviewers split by role: editorial-board members are solid circles; non-EB
+# candidate authors (rank "Not_EB") read as secondary — smaller, fainter open
+# circles. Drawn first so the editorial board sits on top where they overlap.
+is_neb = view["rank"] == "Not_EB"
+eb_points = (
+    alt.Chart(view[~is_neb])
+    .mark_circle(opacity=0.85)
+    .encode(**enc, size=_size_enc([40, 600], 140), color=_color_enc(True))
+)
+neb_points = (
+    alt.Chart(view[is_neb])
+    .mark_point(filled=False, opacity=0.7, strokeWidth=2)
+    .encode(**enc, size=_size_enc([90, 380], 120), color=_color_enc(False))
+)
+# Non-EB drawn last so the open rings are never hidden under filled EB circles.
+layers = [background, eb_points, neb_points]
 if has_query:
     labels = (
         alt.Chart(view.head(12))
