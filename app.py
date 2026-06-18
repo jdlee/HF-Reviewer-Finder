@@ -138,6 +138,10 @@ with st.sidebar:
     st.divider()
     method = st.radio(
         "2D projection", ["pca", "umap"], index=0,
+        format_func=lambda m: {
+            "pca": "pca (preserve macro structure)",
+            "umap": "umap (preserve local structure)",
+        }[m],
         help="PCA is fast & deterministic. UMAP clusters topics more tightly "
              "(requires umap-learn; falls back to PCA if unavailable).",
     )
