@@ -92,7 +92,9 @@ The `Not_EB` rows are (re)built by two helper scripts:
   the embeddings/projection cache so the app picks up the change.
 
 `data/Human_Factors_*abstracts*.json` — recent *Human Factors* article abstracts
-(currently **1,000** papers across two batches) shown as the grey background field.
+(currently **976** papers across two batches, after `clean_corpus.py` drops
+editorial boilerplate — acknowledgments, errata, corrigenda, publication notices)
+shown as the grey background field.
 Drop in more `Human_Factors_*abstracts*.json` batches and they're picked up
 automatically (re-run `precompute.py` afterward).
 
