@@ -210,9 +210,19 @@ if has_query:
 
 def _size_enc(size_range: list[int], flat: int):
     """Size by similarity when ranking, else a flat size. Non-EB layers pass a
-    smaller range/flat value so they read as secondary."""
+    smaller range/flat value so they read as secondary.
+
+    The shared `domain` (= sim_domain) is essential: it ties both layers to the
+    *same* similarity→size mapping, so a non-EB and an EB point with equal
+    similarity differ only by the layer's `range` (the intended 15% size gap).
+    The layered chart also resolves `size` independently (see below) so each
+    layer's `range` is actually honoured rather than merged by Vega-Lite."""
     if has_query:
-        return alt.Size("similarity:Q", scale=alt.Scale(range=size_range), legend=None)
+        return alt.Size(
+            "similarity:Q",
+            scale=alt.Scale(range=size_range, domain=sim_domain),
+            legend=None,
+        )
     return alt.value(flat)
 
 
@@ -257,10 +267,17 @@ neb_points = (
 # Non-EB drawn last so the open rings are never hidden under filled EB circles.
 layers = [background, eb_points, neb_points]
 if has_query:
+    # Top-N reviewer names, dodged vertically so nearby labels don't overlap.
+    lab = view.head(12).copy()
+    lab["y_label"] = engine.dodge_label_y(
+        lab["x"].to_numpy(), lab["y"].to_numpy(),
+        view["x"].max() - view["x"].min(),
+        view["y"].max() - view["y"].min(),
+    )
     labels = (
-        alt.Chart(view.head(12))
+        alt.Chart(lab)
         .mark_text(align="left", dx=8, dy=0, fontSize=10, color="#333")
-        .encode(x="x:Q", y="y:Q", text="name:N")
+        .encode(x="x:Q", y="y_label:Q", text="name:N")
     )
     query_df = pd.DataFrame({"x": [qcoord[0]], "y": [qcoord[1]], "label": ["Manuscript"]})
     submission = (
@@ -279,6 +296,10 @@ if has_query:
 chart = (
     alt.layer(*layers)
     .properties(height=520)
+    # Size scales must be independent so the EB ([40,600]) and non-EB ([29,434])
+    # ranges each apply; otherwise Vega-Lite merges them into one shared size
+    # scale and the 15% size gap is lost. Color stays shared → one legend.
+    .resolve_scale(size="independent")
     .configure_view(strokeWidth=0)
     .configure(font="-apple-system, BlinkMacSystemFont, 'SF Pro Text', Helvetica, sans-serif")
     .configure_legend(titleFontWeight="normal", labelColor="#6e6e73", titleColor="#6e6e73")
