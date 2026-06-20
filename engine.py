@@ -252,6 +252,38 @@ def place_query(query_emb, fit_emb, fit_coords, k: int = 15) -> np.ndarray:
     return (w[:, None] * np.asarray(fit_coords, dtype=np.float64)[idx]).sum(axis=0)
 
 
+def dodge_label_y(
+    x, y, x_range, y_range, min_gap_frac: float = 0.03, x_tol_frac: float = 0.16
+) -> np.ndarray:
+    """Return adjusted y-coordinates that vertically separate map labels whose
+    points sit close together, so reviewer names don't overlap.
+
+    Greedy stack in data space (process points bottom-to-top; nudge each one up
+    until it clears already-placed labels that are near it in x). Points with no
+    near neighbour keep their original y. Because the y axis maps `y_range` onto a
+    fixed pixel height, `min_gap_frac` behaves like a constant pixel gap (≈
+    min_gap_frac × chart_height), independent of the data's absolute scale.
+
+    `x`, `y` are 1D arrays of the labelled points' coordinates; `x_range`/
+    `y_range` are the full extents of the plotted data (so tolerances are
+    relative to what's on screen). Returns a new array of y positions.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    xr = float(x_range) or 1.0
+    yr = float(y_range) or 1.0
+    min_gap = yr * min_gap_frac
+    x_tol = xr * x_tol_frac
+    adj = y.copy()
+    placed: list[int] = []
+    for i in np.argsort(y, kind="stable"):  # ascending y → stack upward
+        for j in placed:
+            if abs(x[i] - x[j]) < x_tol and (adj[i] - adj[j]) < min_gap:
+                adj[i] = adj[j] + min_gap
+        placed.append(int(i))
+    return adj
+
+
 # Default manuscript shown (and ranked) on first load — kept here so both the
 # app and the precompute script reference the same text.
 DEFAULT_QUERY = (

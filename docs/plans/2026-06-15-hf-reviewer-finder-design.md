@@ -1,56 +1,223 @@
-# HF Reviewer Finder — Design (2026-06-15)
+# HF Reviewer Finder — Design
+
+*Created 2026-06-15; revised 2026-06-20 to match the implemented app.*
+
+This document describes the application in enough detail to rebuild it from
+scratch: data schemas, the matching engine API, the caching/precompute pipeline,
+the exact visualization encodings, and deployment constraints.
 
 ## Purpose
-Given a *Human Factors* manuscript (title + abstract or topic description), help an
-editor find the most topically relevant reviewers from the journal's reviewer pool,
-shown both as a 2D semantic map and a ranked table.
 
-## Decisions
-- **Location:** `~/_Code/HF-Reviewer-Finder/`
-- **Match engine:** local sentence-transformers embeddings (`all-MiniLM-L6-v2`),
-  cosine similarity. No API key; offline after first model download.
-- **Visualization:** Altair 2D semantic map (reviewers as points colored/sized by
-  similarity; manuscript shown as a ★) + ranked table. PCA projection by default,
-  UMAP optional with automatic PCA fallback.
-- **Framework:** Streamlit (matches user preference; Altair over Plotly).
+Given a *Human Factors* manuscript (title + abstract, or any topic description),
+help an editor find the most topically relevant reviewers from the journal's
+reviewer pool. Results are shown two ways: a 2D semantic map (where the
+manuscript lands relative to reviewers and to a background field of recent HF
+articles) and a similarity-ranked, selectable table with per-reviewer detail.
+
+## Key decisions
+
+- **Location:** `~/_Code/HF-Reviewer-Finder/`.
+- **Match engine:** local `sentence-transformers` embeddings
+  (`all-MiniLM-L6-v2`, 384-dim, L2-normalized), cosine similarity (= dot product
+  on normalized vectors). No API key; offline after the one-time model download.
+- **Projection:** reviewers **and** a background field of article abstracts are
+  *co-fit* on one shared 2D manifold so both groups live in the same space. PCA
+  by default (fast, deterministic); UMAP optional (tighter topic clusters).
+- **Numba-free at runtime:** the 2D coordinates are precomputed offline and
+  committed as portable `.npz`; the per-query manuscript point is placed with a
+  numpy k-NN method (`place_query`), so the deployed app never imports
+  `umap`/`numba`. This avoids numba's lag behind new Python releases.
+- **Framework:** Streamlit + Altair (not Plotly). Apple-HIG-inspired styling.
 
 ## Architecture
+
 ```
-engine.py   pure-Python: load CSV → build per-reviewer profile text → embed
-            (disk-cached) → cosine similarity → 2D projection (+ query transform)
-app.py      Streamlit UI: text box, example loader, sidebar filters, Altair map,
-            ranked table, per-reviewer detail expander
-data/members_enriched.csv   75 reviewers (from HF_Review skill)
+engine.py            pure-Python (no Streamlit): data loading, profile building,
+                     embedding (disk-cached), cosine similarity, 2D projection
+                     (co-fit + numba-free query placement), label dodge, default
+                     query text. Importable + CLI-testable.
+app.py               Streamlit UI: sidebar query form + projection toggle,
+                     layered Altair map, ranked table, selection-driven detail.
+precompute.py        Offline: build & cache all embeddings + PCA/UMAP coords +
+                     default-query embedding, so the app starts with no model load.
+
+data/members_enriched.csv          162 reviewers (schema below).
+data/Human_Factors_*abstracts*.json  ~976 recent HF article abstracts (background).
+data/not_eb_parts/*.json           per-author research profiles for Not_EB rows.
+data/.cache/                       committed embeddings + projection coords (~2 MB).
+
+enrich_metadata.py   add Crossref citation_count + authors_orcid to abstract batches.
+clean_corpus.py      drop editorial boilerplate (errata, acknowledgments, …).
+aggregate_not_eb.py  rebuild all Not_EB rows from not_eb_parts/, dedup vs. board.
 ```
 
-## Data flow
-1. `load_members()` builds `profile_text` per reviewer = expertise_overview + the
-   3 recent + 2 seminal citations and their synopses.
-2. `embed_corpus()` embeds all profiles once, cached to `data/.cache/emb_<hash>.npy`
-   (hash of texts + model name → re-embeds only when the CSV changes).
-3. On query: `embed_query()` → `cosine_similarity()` → `project_2d()` places the
-   query in the same PCA/UMAP space via `.transform()`.
-4. UI renders the map (layered Altair: points + top-12 labels + query ★) and a
-   similarity-ranked table with a top-N slider and role filter.
+## Data
 
-## Components
-- **Sidebar:** projection method (PCA/UMAP), role filter (AE/EB/R/PR), top-N slider.
-- **Map:** color = similarity (viridis), size = similarity, tooltip = name/role/score/
-  expertise; manuscript ★ in crimson.
-- **Table:** rank #, reviewer, role, similarity (progress bar), expertise, recent pub.
-- **Detail expander:** full expertise overview + all publications + notes for one reviewer.
+### `members_enriched.csv` — the reviewer pool (162 rows)
+
+Columns (exactly): `name`, `rank`, `found`, `recent_1`, `recent_1_synopsis`,
+`recent_2`, `recent_2_synopsis`, `recent_3`, `recent_3_synopsis`, `seminal_1`,
+`seminal_1_synopsis`, `seminal_2`, `seminal_2_synopsis`, `expertise_overview`,
+`notes`.
+
+`rank` is the role code and drives the two reviewer layers on the map:
+
+| rank     | meaning                                  | count | map glyph     |
+|----------|------------------------------------------|-------|---------------|
+| EB       | editorial board                          | 39    | solid circle  |
+| PR       | past reviewer / panel of reviewers       | 20    | solid circle  |
+| AE       | associate editor                         | 12    | solid circle  |
+| R        | reviewer                                 | 4     | solid circle  |
+| Not_EB   | prolific HF author, *not* on the board   | 87    | open circle   |
+
+The 75 editorial-board rows (AE/EB/R/PR) are generated by the `HF_Review` Claude
+skill (Power BI scrape + web research). The 87 `Not_EB` rows are prolific authors
+(>3 papers in the abstract corpus) added as candidate reviewers. **All citations
+are LLM-researched — verify before formal/editorial use.**
+
+### `Human_Factors_*abstracts*.json` — background article field (~976 records)
+
+Multiple batches, concatenated and de-duplicated by DOI (falling back to title).
+Each record: `title`, `authors` (comma-separated string), `date`, `doi`,
+`abstract`, plus Crossref-enriched `citation_count` (int), `authors_orcid`
+(list of `{name, orcid|null}`), and `enriched_date` (ISO date). The app only uses
+`title` + `abstract` (concatenated into `abstract_text`); the enrichment fields
+support the `Not_EB` author selection done offline.
+
+### Data pipeline (offline, idempotent)
+
+1. `clean_corpus.py` — removes boilerplate titles (acknowledgments, errata,
+   corrigenda, publication notices) from the abstract batches by title regex.
+2. `enrich_metadata.py` — fetches Crossref `citation_count` + `authors_orcid` per
+   DOI; resumable (skips already-enriched records unless `--force`).
+3. `aggregate_not_eb.py` — rebuilds every `Not_EB` row from
+   `data/not_eb_parts/*.json`, leaving board rows untouched; nickname-aware
+   dedup against the board (e.g. PR "McDonald, Tony" == "McDonald, Anthony D.")
+   drops the duplicate, keeping the board entry.
+4. `precompute.py` — refresh the embedding/projection caches after any data change.
+
+## Engine API (`engine.py`)
+
+- `load_members(path)` → DataFrame. Adds `profile_text` (`expertise_overview` +
+  the 3 recent and 2 seminal citations and their synopses, blank-skipped),
+  `expertise_short` and `top_recent` (truncated for tables/tooltips).
+- `load_abstracts(glob)` → DataFrame. Concatenate batches, dedup by DOI/title,
+  build `abstract_text` (`title + ". " + abstract`) and `title_short`.
+- `get_model(name)` — lazily imported, `lru_cache`d `SentenceTransformer`.
+- `embed_corpus(texts)` / `embed_query(text)` → float32 arrays, L2-normalized.
+  `embed_corpus` caches to `data/.cache/emb_<hash>.npy` keyed by a SHA-256 of the
+  texts + model name (re-embeds only when content changes).
+- `cosine_similarity(corpus, q)` → `corpus @ q` (inputs already normalized).
+- `fit_project(corpus, extra, method, seed)` — co-fit PCA/UMAP on
+  `vstack([reviewers, abstracts])`, return `(reducer, corpus_coords, extra_coords)`.
+  UMAP failures fall back to PCA on the same data.
+- `load_or_build_projection_coords(corpus, extra, method)` — return
+  `(corpus_coords, extra_coords)`, persisted as a **portable** `.npz` (plain
+  numbers, version-independent) keyed by a content hash of the embeddings+method.
+  The runtime reads this and never needs a pickled reducer or numba.
+- `place_query(query_emb, fit_emb, fit_coords, k=15)` — numba-free placement of
+  the manuscript point: cosine-similarity-weighted average of the 2D coords of its
+  k nearest co-fit neighbours. Works identically for PCA and UMAP layouts.
+- `dodge_label_y(x, y, x_range, y_range, min_gap_frac=0.03, x_tol_frac=0.16)` —
+  greedy data-space vertical declutter so map labels whose points sit close in x
+  don't overlap. Because the y axis maps `y_range` onto a fixed pixel height,
+  `min_gap_frac` behaves like a constant pixel gap.
+- `DEFAULT_QUERY` / `default_query_embedding()` — the manuscript shown (and
+  ranked) on first load; its embedding is precomputed to disk so the initial load
+  needs no model in memory.
+- `rank_reviewers(df, query, method)` — convenience end-to-end (used by the CLI
+  smoke test under `__main__`).
+
+### Caching & precompute
+
+All heavy artifacts live in `data/.cache/` and are **committed** (~2 MB) so a cold
+deploy is fast: `emb_<hash>.npy` (reviewer + abstract embeddings),
+`coords_<method>_<hash>.npz` (PCA + UMAP co-fit coordinates),
+`default_query_<hash>.npy`. Keys are content hashes, so editing the CSV or adding
+an abstract batch invalidates only what changed. `precompute.py` builds them all;
+cache writes degrade gracefully on a read-only/ephemeral filesystem (recompute in
+memory instead of crashing).
+
+## UI (`app.py`)
+
+**Sidebar.** Header "Manuscript description"; a `st.form` with a 300px text area
+(seeded with `DEFAULT_QUERY`) and a primary "Find reviewers" submit button
+(Apple capsule style); a divider; a PCA/UMAP radio ("pca — preserve macro
+structure" / "umap — preserve local structure"); a caption noting citations are
+LLM-researched. Submitting copies the text area into `st.session_state["query"]`.
+
+**Header.** Title `🔍 Reviewer Finder: {len(df)} reviewers mapped`; two captions
+explaining the embeddings and the map legend (open circles = non-board authors;
+red circle = your manuscript; closer + brighter = better match).
+
+**Map (layered Altair, `height=520`, no zoom/pan).** Layers bottom→top:
+
+1. *Background field* — abstract points, fixed `size=20`, grey `#d4d4d8`,
+   `opacity=0.45`.
+2. *Editorial board* (`rank != "Not_EB"`) — `mark_circle`, `opacity=0.85`.
+3. *Non-board* (`rank == "Not_EB"`) — open `mark_point` (`filled=False`,
+   `strokeWidth=2`, `opacity=0.7`), drawn last so rings aren't hidden.
+4. When a query is present: dodged top-12 name labels, the red manuscript marker
+   (`#ff3b30`, `size=520`, white stroke) and its "Manuscript" label.
+
+Encodings when ranking (`has_query`):
+
+- **Color** = `similarity` on a **reversed viridis** scale with a shared
+  `domain=[min,max]` similarity → low similarity is *lighter*, high is darker.
+  One shared color scale across layers ⇒ a single legend.
+- **Size** = `similarity`, shared `domain` but different per-layer ranges: board
+  `[40, 600]`, non-board `[29, 434]` (= board scaled by `0.85² ≈ 0.7225`, i.e.
+  non-board circles 15% smaller in *diameter*). The chart sets
+  `.resolve_scale(size="independent")` so both ranges actually apply — without it
+  Vega-Lite merges the two into one shared size scale and the gap is lost.
+- Without a query, color/size are flat constants (map only, no ranking).
+
+**Ranked table.** Top `TABLE_N=25` reviewers; a name filter text input
+(substring, case-insensitive); columns `# / Reviewer / Role / Similarity /
+Expertise / Most recent publication`, with Similarity as a `ProgressColumn`.
+`st.dataframe(..., on_select="rerun", selection_mode="single-row")`; the top row
+is pre-selected on first render.
+
+**Detail panel.** Driven by the table row selection: bordered container showing
+name · role · similarity, the full expertise overview, recent publications (1–3)
+and seminal publications (1–2) with synopses, and notes if present.
 
 ## Error handling / edge cases
-- Empty query → info message, `st.stop()`.
-- UMAP missing or transform failure → silent PCA fallback.
-- Missing/blank cells handled via `fillna("")` and truthy checks.
+
+- Missing/malformed data files → clear in-app `st.error` + `st.stop()` (no stack
+  trace).
+- Empty query → map renders, ranking/table skipped via `st.stop()`.
+- UMAP unavailable or fit/transform failure → silent PCA fallback (build time).
+- Read-only/ephemeral cache dir → recompute in memory, don't crash.
+- Blank cells handled via `fillna("")` + truthy checks; degenerate similarity
+  ranges tolerated by the shared domain.
+
+## Dependencies & deployment
+
+`requirements.txt` pins floors + sub-major ceilings: `streamlit>=1.40,<2`,
+`altair>=5,<7`, `pandas>=2,<4`, `numpy>=1.24,<3`, `scikit-learn>=1.3,<2`,
+`sentence-transformers>=2.2,<6`. **`umap-learn` is intentionally not a runtime
+dependency** — install it only to rebuild UMAP coords offline
+(`pip install "umap-learn>=0.5,<0.6"`).
+
+Tested on Streamlit Community Cloud (`app.py`). Numba-free runtime means it runs
+even on Python 3.14; 3.13 recommended in Advanced settings for safety. The stack
+includes `torch` (large install). Committed `data/.cache/*` means a cold start
+does not download the model, embed ~1,075 texts, or fit any projection; only a
+*custom* (non-default) manuscript lazily loads the model to embed it.
 
 ## Testing
-- `python engine.py "<query>"` CLI smoke test prints top-10 matches (no browser).
-- Manual: launch Streamlit, verify map renders, ★ appears, table ranks sensibly
-  (e.g. a trust/automation abstract surfaces Lee, Wickens, de Winter, etc.).
 
-## YAGNI (explicitly out of scope)
-- No live Altair brush→table linking (sidebar filters suffice).
-- No ScholarOne API integration (separate concern; see HF_Review skill).
+- `python engine.py "<query>"` — CLI smoke test prints the top-10 matches (no
+  browser); a trust/automation abstract should surface Lee, Wickens, de Winter, etc.
+- `engine.dodge_label_y` is pure and unit-testable: clustered labels separate by
+  ≥ the min gap; isolated labels are unchanged.
+- Manual: launch Streamlit, confirm the map renders, the red manuscript marker
+  appears, board vs. non-board glyphs differ in fill and size, labels don't
+  overlap, and the table + detail panel track the selected row.
+
+## YAGNI (out of scope)
+
+- No live Altair brush → table linking (the ranked table + name filter suffice).
+- No ScholarOne API integration (separate concern; see `HF_Review` skill).
 - No conflict-of-interest / co-author exclusion logic (future enhancement).
