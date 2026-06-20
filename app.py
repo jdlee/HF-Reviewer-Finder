@@ -150,7 +150,7 @@ with st.sidebar:
 query = st.session_state.get("query", "")
 has_query = bool(query.strip())
 
-st.title(f"🔍 HF Reviewer Finder: {len(df)} reviewers mapped and ranked")
+st.title(f"🔍 Reviewer Finder: {len(df)} reviewers mapped")
 st.caption(
     "Local sentence-transformer embeddings of each *Human Factors* reviewer's expertise and "
     "key publications, ranked against your manuscript."
@@ -221,7 +221,7 @@ def _color_enc(show_legend: bool):
     if has_query:
         return alt.Color(
             "similarity:Q",
-            scale=alt.Scale(scheme="viridis", domain=sim_domain),
+            scale=alt.Scale(scheme="viridis", domain=sim_domain, reverse=True),
             legend=alt.Legend(title="Similarity") if show_legend else None,
         )
     return alt.value("#4c78a8")
@@ -250,7 +250,9 @@ eb_points = (
 neb_points = (
     alt.Chart(view[is_neb])
     .mark_point(filled=False, opacity=0.7, strokeWidth=2)
-    .encode(**enc, size=_size_enc([90, 380], 120), color=_color_enc(False))
+    # Non-EB circles 15% smaller (diameter) than the editorial board's, i.e.
+    # the EB size/area range [40, 600]/140 scaled by 0.85**2 ≈ 0.7225.
+    .encode(**enc, size=_size_enc([29, 434], 101), color=_color_enc(False))
 )
 # Non-EB drawn last so the open rings are never hidden under filled EB circles.
 layers = [background, eb_points, neb_points]
